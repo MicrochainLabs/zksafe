@@ -1,4 +1,7 @@
 use dep::std;
+use std::hash::poseidon;
+
+global TREE_SIZE: u32 = 4;
 
 type Address = [u8; 20];
 type Signature = [u8; 64];
@@ -26,8 +29,28 @@ fn cmp_gt<let N: u32>(a: [u8; N], b: [u8; N]) -> bool {
     result
 }
 
+fn hash_values(leaves: [Field; 2]) -> Field {
+    let hash = poseidon::bn254::hash_2(leaves);
+    hash
+}
+
+fn merkle_tree_root<let N: u32>(leaf: Field, path_indices: Field, siblings: ([Field; N])) -> Field {
+    let index_bits : [u1; N] = path_indices.to_be_bits();
+    let mut current = leaf;
+    for i in 0..N {
+        let path_bit = index_bits[i] as bool;
+        let (hash_left, hash_right) = if path_bit {
+            (siblings[i], current)
+        } else {
+            (current, siblings[i])
+        };
+        current = hash_values([hash_left, hash_right]);
+    }
+    current
+}
+
 /// Verify if the signatures are valid and the signers are in the owners list.
-fn verify_signers<let T: u32, let N: u32>(threshold: u8, signers: [PubKey; T], signatures: [Signature; T], txn_hash: Hash, owners: [Address; N]) {
+fn verify_signers<let T: u32>(threshold: u8, signers: [PubKey; T], signatures: [Signature; T], txn_hash: Hash, owners_root: Field, indices: [Field; T], siblings: [[Field; TREE_SIZE]; T]) {
     let mut curr_owner = [0; 20];
     let mut num_verified_signatures = 0;
     // We use the generator point of the secp256k1 curve as the NIL value.
@@ -53,21 +76,25 @@ fn verify_signers<let T: u32, let N: u32>(threshold: u8, signers: [PubKey; T], s
             // We need this to avoid the same signature being used mulitple times.
             // (Check Safe verification code for more details - it does the same checking).
             assert(cmp_gt(address, curr_owner));
-            // Check that the address is in the list of owners.
-            let mut found = false;
-            for j in 0..N {
-                if address == owners[j] {
-                   found = true;
-               }
-           }
-           assert(found);
-           curr_owner = address;
-           num_verified_signatures += 1;
+
+            // Check that the address is in the merkle tree of owners.   
+            let mut result : Field = 0;
+            let mut v : Field = 1;
+            for k in 0..20 {
+                result += address[19 - k] as Field * v;
+                v *= 256 as Field;
+            }
+
+            let address_hash = poseidon::bn254::hash_1([result]);
+            assert(owners_root == merkle_tree_root(address_hash, indices[i], siblings[i]));
+
+            curr_owner = address;
+            num_verified_signatures += 1;
         }
     }
     assert(num_verified_signatures >= threshold);
 }
 
-fn main(threshold: pub u8, signers: [PubKey; 10], signatures: [Signature; 10], txn_hash: pub Hash, owners: pub [Address; 10]) {
-    verify_signers(threshold, signers, signatures, txn_hash, owners);
+fn main(threshold: pub u8, signers: [PubKey; 10], signatures: [Signature; 10], txn_hash: pub Hash, owners_root: pub Field, indices: [Field; 10], siblings: [[Field; TREE_SIZE]; 10]) {
+    verify_signers(threshold, signers, signatures, txn_hash, owners_root, indices, siblings);
 }
