@@ -1,7 +1,7 @@
-import { zeroAddress, parseEther, encodeFunctionData, toHex, Account, toBytes, recoverAddress, recoverPublicKey, Hex, createWalletClient, http, WalletClient } from "viem";
+import { zeroAddress, parseEther, encodeFunctionData, toHex, Account, toBytes, recoverAddress, recoverPublicKey, Hex, createWalletClient, http, WalletClient, checksumAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { formatEther } from 'viem';
-import Safe from '@safe-global/protocol-kit';
+import Safe, { HexAddress } from '@safe-global/protocol-kit';
 import { SafeAccountConfig } from '@safe-global/protocol-kit';
 import { SafeTransactionData, SafeSignature } from '@safe-global/types-kit';
 import assert from 'assert';
@@ -13,6 +13,8 @@ import { Noir } from '@noir-lang/noir_js';
 import { UltraHonkBackend } from '@aztec/bb.js';
 
 import ZkSafeModule from "../ignition/modules/zkSafe";
+import { IMT } from "@zk-kit/imt";
+import { Hex, poseidon } from "@iden3/js-crypto";
 
 /// Extract x and y coordinates from a serialized ECDSA public key.
 export function extractCoordinates(serializedPubKey: string): { x: number[], y: number[] } {
@@ -118,7 +120,7 @@ export async function zksend(hre: any, safeAddr: string, to: string, value: stri
     console.log("Transaction result: ", receipt);
 }
 
-export async function proveTransactionSignatures(hre: HardhatRuntimeEnvironment, safe: Safe, signatures: Hex[], txHash: Hex) {
+export async function proveTransactionSignatures(hre: HardhatRuntimeEnvironment, safe: Safe, signatures: Hex[], txHash: Hex, zkSafeModulePrivateOwners: string[], ownersAddressesFormat: number, moduleOwnersRoot: Hex, muduleOwnersThreshold: Hex) {
         const { noir, backend } = await hre.noir.getCircuit("circuits");
         console.log("noir backend initialized");
 
@@ -139,19 +141,48 @@ export async function proveTransactionSignatures(hre: HardhatRuntimeEnvironment,
         sortedSignatures.sort((a, b) => a.addr.localeCompare(b.addr));
         const sortedSigs = sortedSignatures.map(s => s.sig);
 
+        const modulePrivateOwnersTree = new IMT(poseidon.hash, 4, 0, 2)
+        for (var privateOwner of zkSafeModulePrivateOwners) {
+            /*0: Normal address
+            1: Poseidon Hash address*/
+            if(ownersAddressesFormat == 0)
+                modulePrivateOwnersTree.insert(poseidon.hash([BigInt(privateOwner)]))
+            else if (ownersAddressesFormat == 1) 
+                modulePrivateOwnersTree.insert(BigInt(privateOwner))
+            else
+                throw new Error("Invalid owner addresses format variable value (0: Normal address) or (1: Poseidon Hash address)");
+        }
+        if(moduleOwnersRoot != toHex(modulePrivateOwnersTree.root)){
+            throw new Error("Invalid owners");
+        }
+        const ownersIndicesProof: number[] = []
+        const ownersPathsProof: any[][] = []
+            for (var signature of sortedSigs) {
+            const recoveredAddress = await recoverAddress({hash: txHash, signature: signature});
+            const index= await modulePrivateOwnersTree.indexOf(poseidon.hash([BigInt(recoveredAddress)]));
+            const addressProof= await modulePrivateOwnersTree.createProof(index);
+            addressProof.siblings = addressProof.siblings.map((s) => s[0])
+            await ownersIndicesProof.push(Number("0b" + await addressProof.pathIndices.join("")))
+            await ownersPathsProof.push(addressProof.siblings)
+        }
+
         const input = {
-            threshold: await safe.getThreshold(),
+            threshold: muduleOwnersThreshold,
             signers: padArray(await Promise.all(sortedSigs.map(async (sig) => {
                 const pubKey = await recoverPublicKey({
                     hash: txHash as `0x${string}`,
                     signature: sig
                 });
+                const recoveredAddress = await recoverAddress({hash: txHash, signature: signature});
                 return extractCoordinates(pubKey);
             })), 10, nil_pubkey),
             signatures: padArray(sortedSigs.map(sig => extractRSFromSignature(sig)), 10, nil_signature),
             txn_hash: Array.from(toBytes(txHash as `0x${string}`)),
-            owners: padArray((await safe.getOwners()).map(addressToArray), 10, zero_address),
+            owners_root:  moduleOwnersRoot,
+            indices: padArray(ownersIndicesProof.map(indice => toHex(indice)), 10, "0x0"),
+            siblings: padArray(ownersPathsProof.map(paths => paths.map(path => toHex(path))), 10, ["0x0", "0x0", "0x0", "0x0"])
         };
+       
         // Generate witness first
         const { witness } = await noir.execute(input);
 
@@ -166,7 +197,7 @@ export async function proveTransactionSignatures(hre: HardhatRuntimeEnvironment,
 }
 
 
-export async function prove(hre: HardhatRuntimeEnvironment, safeAddr: string, txHash: string, signatures_: string) {
+export async function prove(hre: HardhatRuntimeEnvironment, safeAddr: string, txHash: string, signatures_: string, zkSafeModulePrivateOwners: string[], ownersAddressesFormat: number) {
     // Initialize Safe - we need it to prepare the witness (owners/threeshold) from onchain data.
     const safe = await Safe.init({
         provider: hre.network.config.url,
@@ -191,7 +222,30 @@ export async function prove(hre: HardhatRuntimeEnvironment, safeAddr: string, tx
         }
         return true;
     });
-    const proof = await proveTransactionSignatures(hre, safe, signatures as Hex[], txHash as Hex);
+    
+    
+    // Find ZkSafeModule
+    const modules = await safe.getModules();
+    let zkSafeModule = null;
+    for (const moduleAddress of modules) {
+        console.log("Checking module: ", moduleAddress);
+        try {
+            const module = await hre.viem.getContractAt("ZkSafeModule", moduleAddress);
+            const version = await module.read.zkSafeModuleVersion();
+            console.log("ZkSafe version: ", version);
+            zkSafeModule = module;
+            break;
+        } catch (e) {
+            console.log("Not a ZkSafe module", e);
+        }
+    }
+    if (!zkSafeModule) {
+        throw new Error(`ZkSafeModule not found on Safe ${address}`);
+    }
+    
+    const safeModuleConfig = await zkSafeModule.read.safeToConfig([address])
+
+    const proof = await proveTransactionSignatures(hre, safe, signatures as Hex[], txHash as Hex, zkSafeModulePrivateOwners, ownersAddressesFormat, safeModuleConfig[0], toHex(safeModuleConfig[1]));
     console.log("Proof: ", toHex(proof.proof));
 }
 
@@ -242,12 +296,14 @@ export async function sign(hre: HardhatRuntimeEnvironment, safeAddr: string, to:
     console.log("txHash", txHash);
 
     // Sign the transaction using the Safe instance
-    const signedTransaction = await safe.signTransaction(transaction);
+    /*const signedTransaction = await safe.signTransaction(transaction);
     const safeSig = signedTransaction.getSignature(mywalletAddress)!;
+    console.log("Signature: ", safeSig.data);*/
+    const safeSig = await safe.signTypedData(transaction);
     console.log("Signature: ", safeSig.data);
 }
 
-export async function createZkSafe(hre: HardhatRuntimeEnvironment, owners: string[], threshold: number) {
+export async function createZkSafe(hre: HardhatRuntimeEnvironment, owners: string[], threshold: number, zkSafeModulePrivateOwners: string[], zkSafeModuleThreshold: number) {
     // Get wallet client
     const pk = vars.get("DEPLOYER_PRIVATE_KEY") as string;
     const account = privateKeyToAccount(ensureHexPrefix(pk));
@@ -264,17 +320,33 @@ export async function createZkSafe(hre: HardhatRuntimeEnvironment, owners: strin
 
     console.log("zkSafeModule: ", zkSafeModule.address);
 
+    //@ts-ignore
+    const modulePrivateOwnersTree = new IMT(poseidon.hash, 4, 0, 2)
+    for (var privateOwner of zkSafeModulePrivateOwners) {
+        modulePrivateOwnersTree.insert(poseidon.hash([BigInt(privateOwner)]))
+    }
     // Enable module
     const calldata = encodeFunctionData({
         abi: [{
-            name: 'enableModule',
-            type: 'function',
-            stateMutability: 'nonpayable',
-            inputs: [{ name: 'module', type: 'address' }],
-            outputs: []
+            "inputs": [
+                {
+                "internalType": "bytes32",
+                "name": "ownersRoot",
+                "type": "bytes32"
+                },
+                {
+                "internalType": "uint256",
+                "name": "threshold",
+                "type": "uint256"
+                }
+            ],
+            "name": "enableModule",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function"
         }],
         functionName: 'enableModule',
-        args: [zkSafeModule.address]
+        args: [toHex(modulePrivateOwnersTree.root), BigInt(zkSafeModuleThreshold)]
     });
 
     const safe = await Safe.init({
@@ -282,7 +354,7 @@ export async function createZkSafe(hre: HardhatRuntimeEnvironment, owners: strin
         predictedSafe: {
             safeAccountConfig: {
                 owners,
-                threshold: 1,
+                threshold: threshold,
                 to: zkSafeModule.address,
                 data: calldata,
             }
@@ -309,4 +381,5 @@ export async function createZkSafe(hre: HardhatRuntimeEnvironment, owners: strin
     }
 
     console.log("Created zkSafe at address: ", safeAddress);
+    console.log("Private owners addresses: ", modulePrivateOwnersTree.leaves);
 }
